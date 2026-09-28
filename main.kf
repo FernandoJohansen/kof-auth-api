@@ -1,0 +1,275 @@
+// kof-auth-api — API de autenticação endurecida em Kof
+//
+// Target: JVM (kof.web + auth.* + app.security são JVM-only na 0.5.0-beta).
+// Rodar:  ADMIN_PASSWORD='...' JWT_SECRET="$(openssl rand -hex 32)" kof run main.kf
+//
+// Defesas implementadas (detalhes no README):
+//   senhas PBKDF2 via passwords.hash, política de senha, anti-enumeração de usuário
+//   (mesma mensagem + tempo equalizado), rate limit por IP e por conta, JWT HS256
+//   curto com iss/aud/jti verificados, revogação no logout, RBAC, limite de corpo,
+//   allow-list EXATA de rotas públicas, headers de segurança e log de auditoria.
+
+record Credenciais(String username, String password)
+record Erro(String erro)
+record Mensagem(String mensagem)
+record Perfil(String username, String role)
+record TokenResposta(String access_token, String token_type, Int expires_in)
+record Claims(String sub, List<String> roles, String iss, String aud, String jti)
+
+class Conta {
+    String username
+    String hash
+    String role
+}
+
+// ---------- configuração ----------
+
+String emissor() = "kof-auth"
+String audiencia() = "kof-api"
+Int ttlToken() = 900             // 15 min: token roubado vale pouco tempo
+Int maxCorpo() = 4096            // bytes: nada legítimo aqui passa disso
+Int tentativasLogin() = 5        // por conta...
+Int janelaLogin() = 900          // ...a cada 15 min
+
+String segredoJwt() {
+    var s = secrets.get("JWT_SECRET", "")
+    if (s.length() >= 64) {
+        return s
+    }
+    log.warn("JWT_SECRET ausente ou curto (< 32 bytes hex): gerando segredo efêmero; tokens morrem no restart")
+    return jwt.secret()
+}
+
+// ---------- validação ----------
+
+Bool usernameValido(String u) {
+    if (u.length() < 3 || u.length() > 32) {
+        return false
+    }
+    for (var i = 0; i < u.length(); i++) {
+        var c = u.charAt(i)
+        var ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-'
+        if (!ok) {
+            return false
+        }
+    }
+    return true
+}
+
+Set<String> senhasComuns() {
+    return setOf("123456789012", "password1234", "senha1234567", "qwertyuiop12",
+                 "123456123456", "iloveyou1234", "admin1234567", "aaaaaaaaaaaa",
+                 "000000000000", "abc123abc123", "brasil123456", "flamengo1234")
+}
+
+// Retorna o motivo da recusa, ou null se a senha é aceitável.
+String? problemaNaSenha(String senha, String username) {
+    if (senha.length() < 12) {
+        return "a senha precisa ter pelo menos 12 caracteres"
+    }
+    if (senha.length() > 128) {
+        return "a senha pode ter no máximo 128 caracteres"
+    }
+    if (senha.toLowerCase().contains(username)) {
+        return "a senha não pode conter o nome de usuário"
+    }
+    if (senhasComuns().contains(senha.toLowerCase())) {
+        return "essa senha é comum demais"
+    }
+    return null
+}
+
+// json.decode deixa campos ausentes como null mesmo em String não anulável,
+// então a checagem explícita aqui é obrigatória.
+Credenciais? lerCredenciais(String corpo) {
+    try {
+        var c = json.decode<Credenciais>(corpo)
+        if (c.username == null || c.password == null) {
+            return null
+        }
+        return c
+    } catch (String e) {
+        return null
+    }
+}
+
+// Allow-list por correspondência EXATA de método + caminho.
+// Nada de prefixo: "/login" não pode liberar "/login-admin".
+Bool rotaPublica(String metodo, String caminho) {
+    return (metodo == "POST" && caminho == "/login")
+        || (metodo == "POST" && caminho == "/register")
+        || (metodo == "GET" && caminho == "/health")
+}
+
+// Nunca ecoa entrada crua no log (log injection): só nomes já validados.
+String paraLog(String username) = if (usernameValido(username)) username else "<inválido>"
+
+// ---------- respostas ----------
+
+String falha(Int codigo, String msg) {
+    headerSet("Cache-Control", "no-store")
+    return status(codigo, json.encode(Erro(msg)))
+}
+
+String sucesso(Int codigo, String corpoJson) {
+    headerSet("Cache-Control", "no-store")
+    return status(codigo, corpoJson)
+}
+
+// ---------- contas ----------
+
+semearAdmin(Map<String, Conta> contas) {
+    var senha = secrets.get("ADMIN_PASSWORD", "")
+    if (senha.length() < 12) {
+        log.warn("ADMIN_PASSWORD ausente ou curta: nenhum admin criado")
+        return
+    }
+    var admin = new Conta()
+    admin.username = "admin"
+    admin.hash = passwords.hash(senha)
+    admin.role = "admin"
+    contas.put("admin", admin)
+    log.info("conta admin criada")
+}
+
+// ---------- servidor ----------
+
+main() {
+    val segredo = segredoJwt()
+    auth.secret(segredo)
+    // Hash de uma senha aleatória: usado quando o usuário não existe, para o
+    // login levar o mesmo tempo nos dois casos (evita enumeração por timing).
+    val hashFalso = passwords.hash(crypto.randomHex(32))
+
+    var contas = new Map<String, Conta>()
+    semearAdmin(contas)
+
+    var app = web.app()
+
+    // Camada da plataforma: headers de segurança + rate limit por IP.
+    // CSRF desligado de propósito: a API usa Bearer token no header, não cookie,
+    // então o navegador não envia credencial automaticamente.
+    var opcoes = mapOf()
+    opcoes.put("rateLimit", "60/60")
+    opcoes.put("csrf", "false")
+    app.security(opcoes)
+
+    // Portão de autenticação: roda antes de qualquer rota.
+    app.use {
+        if (body().length() > maxCorpo()) {
+            return falha(413, "corpo grande demais")
+        }
+        if (rotaPublica(method(), path())) {
+            return null
+        }
+        if (!auth.authenticated()) {
+            headerSet("WWW-Authenticate", "Bearer")
+            return falha(401, "não autenticado")
+        }
+        var token = auth.token()
+        try {
+            var verificado = jwt.verify(token, segredo, emissor(), audiencia())
+        } catch (String e) {
+            return falha(401, "token inválido")
+        }
+        if (cache.get("revogado:" + crypto.sha256(token)) != null) {
+            return falha(401, "token revogado")
+        }
+        return null
+    }
+
+    app.get("/health") {
+        return json.encode(Mensagem("ok"))
+    }
+
+    app.post("/register") {
+        var c = lerCredenciais(body())
+        if (c == null) {
+            return falha(400, "corpo inválido: envie {\"username\", \"password\"}")
+        }
+        var username = c.username.toLowerCase()
+        if (!usernameValido(username)) {
+            return falha(400, "username deve ter 3 a 32 caracteres: a-z, 0-9, _ . -")
+        }
+        var problema = problemaNaSenha(c.password, username)
+        if (problema != null) {
+            return falha(400, problema)
+        }
+        if (contas.containsKey(username)) {
+            return falha(409, "username indisponível")
+        }
+        var conta = new Conta()
+        conta.username = username
+        conta.hash = passwords.hash(c.password)
+        conta.role = "user"
+        contas.put(username, conta)
+        log.info("registro: " + username)
+        return sucesso(201, json.encode(Perfil(username, "user")))
+    }
+
+    app.post("/login") {
+        var c = lerCredenciais(body())
+        if (c == null) {
+            return falha(400, "corpo inválido: envie {\"username\", \"password\"}")
+        }
+        var username = c.username.toLowerCase()
+        if (!security.rateLimit("login:" + username, tentativasLogin(), janelaLogin())) {
+            log.warn("login bloqueado por excesso de tentativas: " + paraLog(username))
+            headerSet("Retry-After", "" + janelaLogin())
+            return falha(429, "muitas tentativas; tente novamente mais tarde")
+        }
+        var conta = contas.get(username)
+        if (conta == null) {
+            passwords.verify(c.password, hashFalso)
+            log.warn("login falhou: " + paraLog(username))
+            return falha(401, "credenciais inválidas")
+        }
+        if (!passwords.verify(c.password, conta.hash)) {
+            log.warn("login falhou: " + paraLog(username))
+            return falha(401, "credenciais inválidas")
+        }
+        if (passwords.needsRehash(conta.hash)) {
+            conta.hash = passwords.hash(c.password)
+        }
+        var claims = Claims(conta.username, listOf(conta.role), emissor(), audiencia(), crypto.randomHex(16))
+        var token = jwt.create(json.encode(claims), segredo, ttlToken())
+        log.info("login ok: " + conta.username)
+        return sucesso(200, json.encode(TokenResposta(token, "Bearer", ttlToken())))
+    }
+
+    app.get("/me") {
+        var conta = contas.get(auth.user())
+        if (conta == null) {
+            return falha(401, "conta não existe mais")
+        }
+        return sucesso(200, json.encode(Perfil(conta.username, conta.role)))
+    }
+
+    app.post("/logout") {
+        // O JWT é stateless: para revogar, guardamos o hash do token até ele
+        // expirar sozinho. Guardar o hash (e não o token) evita vazar tokens
+        // válidos caso o cache seja inspecionado.
+        cache.set("revogado:" + crypto.sha256(auth.token()), "1", ttlToken())
+        log.info("logout: " + auth.user())
+        return sucesso(200, json.encode(Mensagem("sessão encerrada")))
+    }
+
+    app.get("/admin/users") {
+        if (!auth.hasRole("admin")) {
+            log.warn("acesso negado a /admin/users: " + auth.user())
+            return falha(403, "acesso negado")
+        }
+        var lista = listOf<Perfil>()
+        for (var nome in contas.keys()) {
+            var conta = contas.get(nome)
+            if (conta != null) {
+                lista.add(Perfil(conta.username, conta.role))
+            }
+        }
+        return sucesso(200, json.encode(lista))
+    }
+
+    val porta = secrets.get("PORT", "8080").toInt()
+    log.info("kof-auth-api ouvindo na porta " + porta)
+    app.listen(porta)
+}
