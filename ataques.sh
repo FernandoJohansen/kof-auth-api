@@ -2,7 +2,8 @@
 # Suíte de ataques contra a kof-auth-api. Cada teste imprime PASS ou FAIL.
 # Uso: BASE=http://localhost:8080 ADMIN_PASSWORD='...' ./ataques.sh
 # Requer: curl, openssl, base64.
-# Obs.: roda contra um servidor recém-iniciado (o rate limit guarda estado).
+# Obs.: roda contra um servidor recém-iniciado (o rate limit guarda estado),
+#       com banco novo e RATE_LIMIT=300/60 (a suíte faz mais de 60 requisições).
 
 BASE="${BASE:-http://localhost:8080}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:?defina ADMIN_PASSWORD igual ao do servidor}"
@@ -35,6 +36,8 @@ espera "username com quebra de linha (log injection)" 400 -X POST "$BASE/registe
 espera "registro válido" 201 -X POST "$BASE/register" -d "$(json ana 'Cavalo-Bateria-Grampo-9')"
 espera "registro duplicado" 409 -X POST "$BASE/register" -d "$(json ana 'Cavalo-Bateria-Grampo-9')"
 espera "duplicado com maiúsculas (normalização)" 409 -X POST "$BASE/register" -d "$(json ANA 'Cavalo-Bateria-Grampo-9')"
+espera "nome reservado (root)" 409 -X POST "$BASE/register" -d "$(json root 'Cavalo-Bateria-Grampo-9')"
+espera "nome reservado com maiúsculas (Admin)" 409 -X POST "$BASE/register" -d "$(json Admin 'Cavalo-Bateria-Grampo-9')"
 GRANDE=$(head -c 6000 /dev/zero | tr '\0' 'a')
 espera "corpo acima do limite" 413 -X POST "$BASE/register" -d "{\"username\":\"$GRANDE\"}"
 
@@ -47,6 +50,21 @@ T2=$(curl -s -o /dev/null -w "%{time_total}" -X POST "$BASE/login" -d "$(json na
 echo "        tempo senha errada: ${T1}s | usuário inexistente: ${T2}s (devem ser parecidos)"
 TOK=$(post /login "$(json ana 'Cavalo-Bateria-Grampo-9')" | token_de)
 [ -n "$TOK" ] && ok "login válido devolve token" || nok "login válido" "sem token"
+
+echo "== Injeção de SQL"
+R3=$(post /login "{\"username\":\"admin' --\",\"password\":\"qualquer-coisa-123\"}")
+[ "$R3" = "$R2" ] && ok "login com admin' -- não burla a senha" || nok "injeção no login" "$R3"
+R4=$(post /login "{\"username\":\"x' or '1'='1\",\"password\":\"x' or '1'='1\"}")
+[ "$R4" = "$R2" ] && ok "login com ' or '1'='1 não burla a senha" || nok "injeção no login" "$R4"
+
+echo "== Condição de corrida"
+TMP=$(mktemp -d)
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST "$BASE/register" -d "$(json corrida 'Vento-Norte-Pedra-2026')" > "$TMP/$i" &
+done
+wait
+CRIADOS=$(cat "$TMP"/* | grep -c 201); RECUSADOS=$(cat "$TMP"/* | grep -c 409); rm -rf "$TMP"
+[ "$CRIADOS" = "1" ] && ok "20 cadastros simultâneos do mesmo nome criam só 1 conta ($CRIADOS criada, $RECUSADOS recusadas)" || nok "corrida no cadastro" "$CRIADOS criadas, $RECUSADOS recusadas"
 
 echo "== Token"
 espera "/me sem token" 401 "$BASE/me"
