@@ -1,0 +1,5 @@
+# Banco de dados local (contém hashes de senha)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
