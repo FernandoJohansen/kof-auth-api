@@ -2,12 +2,14 @@
 //
 // Target: JVM (kof.web + auth.* + app.security são JVM-only na 0.5.0-beta).
 // Rodar:  ADMIN_PASSWORD='...' JWT_SECRET="$(openssl rand -hex 32)" kof run main.kf
+// Dados:  SQLite em DB_PATH (padrão: kof-auth.db). O driver é baixado pelo kof na 1ª execução.
 //
 // Defesas implementadas (detalhes no README):
 //   senhas PBKDF2 via passwords.hash, política de senha, anti-enumeração de usuário
 //   (mesma mensagem + tempo equalizado), rate limit por IP e por conta, JWT HS256
 //   curto com iss/aud/jti verificados, revogação no logout, RBAC, limite de corpo,
-//   allow-list EXATA de rotas públicas, headers de segurança e log de auditoria.
+//   allow-list EXATA de rotas públicas, headers de segurança, log de auditoria e
+//   persistência em SQLite com binds (sem SQL concatenado) e cadastro atômico.
 
 record Credenciais(String username, String password)
 record Erro(String erro)
@@ -15,12 +17,7 @@ record Mensagem(String mensagem)
 record Perfil(String username, String role)
 record TokenResposta(String access_token, String token_type, Int expires_in)
 record Claims(String sub, List<String> roles, String iss, String aud, String jti)
-
-class Conta {
-    String username
-    String hash
-    String role
-}
+record Conta(String username, String hash, String role)
 
 // ---------- configuração ----------
 
@@ -54,6 +51,11 @@ Bool usernameValido(String u) {
         }
     }
     return true
+}
+
+// Nomes que ninguém pode registrar, para não se passar pela administração.
+Set<String> nomesReservados() {
+    return setOf("admin", "administrator", "root", "system", "suporte", "support")
 }
 
 Set<String> senhasComuns() {
@@ -116,20 +118,54 @@ String sucesso(Int codigo, String corpoJson) {
     return status(codigo, corpoJson)
 }
 
-// ---------- contas ----------
+// ---------- banco de dados ----------
+//
+// Todo SQL deste arquivo é fixo e usa binds (?): nenhum dado do usuário é
+// concatenado em consulta. Atenção: na Kof 0.5.0-beta, erros do banco NÃO são
+// capturados por catch (String e), então o código evita depender deles
+// (ex.: cadastro usa ON CONFLICT em vez de capturar violação de UNIQUE).
 
-semearAdmin(Map<String, Conta> contas) {
+String abrirBanco() {
+    var caminho = secrets.get("DB_PATH", "kof-auth.db")
+    var banco = db.connect("jdbc:sqlite:" + caminho)
+    db.execute(banco, "create table if not exists contas (username text primary key, hash text not null, role text not null check (role in ('user', 'admin')), criado_em text not null default current_timestamp)")
+    log.info("banco de dados: " + caminho)
+    return banco
+}
+
+Conta? buscarConta(String banco, String username) {
+    var linhas = db.query<Conta>(banco, "select username, hash, role from contas where username = ?", username)
+    if (linhas.size == 0) {
+        return null
+    }
+    return linhas.get(0)
+}
+
+// Insere de forma atômica: devolve false se o nome já existe. O banco decide,
+// então dois cadastros simultâneos com o mesmo nome nunca criam duas contas.
+Bool criarConta(String banco, String username, String hash, String role) {
+    var n = db.execute(banco, "insert into contas (username, hash, role) values (?, ?, ?) on conflict (username) do nothing", username, hash, role)
+    return n == 1
+}
+
+atualizarHash(String banco, String username, String hash) {
+    db.execute(banco, "update contas set hash = ? where username = ?", hash, username)
+}
+
+List<Perfil> listarPerfis(String banco) {
+    return db.query<Perfil>(banco, "select username, role from contas order by criado_em, username")
+}
+
+// A variável de ambiente é a fonte da verdade da senha do admin: a cada
+// inicialização, a conta admin é criada ou tem hash e papel restaurados.
+semearAdmin(String banco) {
     var senha = secrets.get("ADMIN_PASSWORD", "")
     if (senha.length() < 12) {
-        log.warn("ADMIN_PASSWORD ausente ou curta: nenhum admin criado")
+        log.warn("ADMIN_PASSWORD ausente ou curta: conta admin não criada nem atualizada")
         return
     }
-    var admin = new Conta()
-    admin.username = "admin"
-    admin.hash = passwords.hash(senha)
-    admin.role = "admin"
-    contas.put("admin", admin)
-    log.info("conta admin criada")
+    db.execute(banco, "insert into contas (username, hash, role) values ('admin', ?, 'admin') on conflict (username) do update set hash = excluded.hash, role = 'admin'", passwords.hash(senha))
+    log.info("conta admin pronta")
 }
 
 // ---------- servidor ----------
@@ -141,8 +177,8 @@ main() {
     // login levar o mesmo tempo nos dois casos (evita enumeração por timing).
     val hashFalso = passwords.hash(crypto.randomHex(32))
 
-    var contas = new Map<String, Conta>()
-    semearAdmin(contas)
+    var banco = abrirBanco()
+    semearAdmin(banco)
 
     var app = web.app()
 
@@ -150,7 +186,7 @@ main() {
     // CSRF desligado de propósito: a API usa Bearer token no header, não cookie,
     // então o navegador não envia credencial automaticamente.
     var opcoes = mapOf()
-    opcoes.put("rateLimit", "60/60")
+    opcoes.put("rateLimit", secrets.get("RATE_LIMIT", "60/60"))   // "requisições/segundos"
     opcoes.put("csrf", "false")
     app.security(opcoes)
 
@@ -195,14 +231,12 @@ main() {
         if (problema != null) {
             return falha(400, problema)
         }
-        if (contas.containsKey(username)) {
+        if (nomesReservados().contains(username)) {
             return falha(409, "username indisponível")
         }
-        var conta = new Conta()
-        conta.username = username
-        conta.hash = passwords.hash(c.password)
-        conta.role = "user"
-        contas.put(username, conta)
+        if (!criarConta(banco, username, passwords.hash(c.password), "user")) {
+            return falha(409, "username indisponível")
+        }
         log.info("registro: " + username)
         return sucesso(201, json.encode(Perfil(username, "user")))
     }
@@ -218,7 +252,7 @@ main() {
             headerSet("Retry-After", "" + janelaLogin())
             return falha(429, "muitas tentativas; tente novamente mais tarde")
         }
-        var conta = contas.get(username)
+        var conta = buscarConta(banco, username)
         if (conta == null) {
             passwords.verify(c.password, hashFalso)
             log.warn("login falhou: " + paraLog(username))
@@ -229,7 +263,7 @@ main() {
             return falha(401, "credenciais inválidas")
         }
         if (passwords.needsRehash(conta.hash)) {
-            conta.hash = passwords.hash(c.password)
+            atualizarHash(banco, conta.username, passwords.hash(c.password))
         }
         var claims = Claims(conta.username, listOf(conta.role), emissor(), audiencia(), crypto.randomHex(16))
         var token = jwt.create(json.encode(claims), segredo, ttlToken())
@@ -238,7 +272,7 @@ main() {
     }
 
     app.get("/me") {
-        var conta = contas.get(auth.user())
+        var conta = buscarConta(banco, auth.user())
         if (conta == null) {
             return falha(401, "conta não existe mais")
         }
@@ -259,14 +293,7 @@ main() {
             log.warn("acesso negado a /admin/users: " + auth.user())
             return falha(403, "acesso negado")
         }
-        var lista = listOf<Perfil>()
-        for (var nome in contas.keys()) {
-            var conta = contas.get(nome)
-            if (conta != null) {
-                lista.add(Perfil(conta.username, conta.role))
-            }
-        }
-        return sucesso(200, json.encode(lista))
+        return sucesso(200, json.encode(listarPerfis(banco)))
     }
 
     val porta = secrets.get("PORT", "8080").toInt()
