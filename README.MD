@@ -2,7 +2,7 @@
 
 Uma API de autenticação feita em [Kof](https://github.com/KofLang/Kof4j), a linguagem brasileira que compila para JVM, nativo e web.
 
-Comecei este projeto para aprender Kof fazendo algo que eu conheço bem: segurança. A ideia era simples. Montar um login do jeito certo, com tudo que costuma faltar em APIs reais, e depois atacar a própria API para ver se as defesas aguentavam. Junto com o código vem um script, o `ataques.sh`, que faz exatamente isso. Na última execução, os 32 ataques foram bloqueados.
+Comecei este projeto para aprender Kof fazendo algo que eu conheço bem: segurança. A ideia era simples. Montar um login do jeito certo, com tudo que costuma faltar em APIs reais, e depois atacar a própria API para ver se as defesas aguentavam. Junto com o código vem um script, o `ataques.sh`, que faz exatamente isso. Na última execução, os 37 ataques foram bloqueados.
 
 No caminho acabei encontrando alguns bugs na própria linguagem. Eles estão no fim deste README.
 
@@ -17,15 +17,23 @@ export LANG=C.UTF-8
 kof run main.kf
 ```
 
+Na primeira execução, o próprio `kof` baixa o driver do SQLite, então precisa de internet uma vez. As contas ficam no arquivo `kof-auth.db`, na pasta de onde você rodou; para usar outro caminho, defina `DB_PATH`.
+
 A `ADMIN_PASSWORD` precisa ter pelo menos 12 caracteres; sem ela, a API sobe sem nenhum admin. Sem o `JWT_SECRET`, ela gera um segredo novo a cada inicialização, o que funciona mas derruba todo mundo quando o servidor reinicia. O `LANG` é só para os acentos do log não saírem quebrados.
 
-Com o servidor rodando, abra outro terminal e solte os ataques:
+Para rodar os ataques, suba o servidor com um banco limpo e um limite por IP mais folgado, porque a suíte faz mais requisições do que os 60 por minuto do padrão:
+
+```bash
+DB_PATH=/tmp/ataque.db RATE_LIMIT=300/60 kof run main.kf
+```
+
+E, em outro terminal:
 
 ```bash
 ADMIN_PASSWORD='uma-senha-admin-longa' ./ataques.sh
 ```
 
-Rode contra um servidor recém-iniciado, porque o rate limit guarda estado entre execuções. No Windows, use o Git Bash.
+Use sempre um servidor recém-iniciado e um banco novo, porque o rate limit e as contas criadas pelos testes interferem numa segunda execução. No Windows, use o Git Bash.
 
 Um detalhe: por enquanto só funciona no target JVM, porque a parte web com autenticação da Kof ainda não chegou no nativo nem no JS.
 
@@ -42,6 +50,12 @@ Registro e login recebem o mesmo formato:
 ## Como ela se defende
 
 **As senhas nunca são guardadas.** O que fica salvo é um hash PBKDF2 com 600 mil iterações e sal, feito pela própria biblioteca da Kof. Na hora do cadastro, a API recusa senhas com menos de 12 caracteres, senhas que contêm o nome de usuário e as mais batidas da internet. Também existe um limite máximo de 128 caracteres, porque calcular hash de uma senha gigante custa caro e isso pode virar arma contra o servidor.
+
+**As contas ficam num banco de verdade.** Os dados vão para um SQLite, e todo SQL do projeto é fixo, com os valores passados por parâmetro (`?`). Nenhum dado de usuário é colado dentro de uma consulta, então injeção de SQL não tem por onde entrar; a suíte tenta os clássicos `admin' --` e `' or '1'='1` no login só para confirmar. O próprio banco também impede papéis inválidos: a coluna de papel só aceita `user` ou `admin`.
+
+**Cadastro sem condição de corrida.** Verificar se um nome existe e depois inserir abre uma brecha: duas requisições ao mesmo tempo passam pela verificação antes de qualquer uma inserir. Aqui quem decide é o banco, numa operação só (`INSERT ... ON CONFLICT DO NOTHING`). O `ataques.sh` dispara 20 cadastros simultâneos com o mesmo nome, e exatamente um vira conta.
+
+**Ninguém se registra como administração.** Nomes como `admin`, `root` e `suporte` são reservados, inclusive com letras maiúsculas. A senha do admin vem da variável de ambiente, que é a fonte da verdade: a cada inicialização, a conta admin é criada ou tem senha e papel restaurados.
 
 **Ela não entrega quem tem conta.** Se você erra a senha de um usuário que existe, recebe exatamente a mesma mensagem de quando o usuário nem existe. Só que isso não basta: se um caso responde mais rápido que o outro, um atacante descobre os usuários só cronometrando. Por isso, quando o usuário não existe, a API calcula o hash de qualquer jeito, contra um hash falso. No teste, as duas respostas levaram 0,166 s e 0,158 s.
 
@@ -63,13 +77,13 @@ Se você está se perguntando sobre CSRF: ficou desligado de propósito. Esse at
 
 Este é um projeto de estudo, não algo para colocar em produção amanhã. Os pontos fracos que eu conheço:
 
-As contas ficam em memória. Reiniciou, sumiu tudo. Além disso, o mapa não é seguro para acesso simultâneo, então dois cadastros com o mesmo nome no mesmo instante poderiam dar problema. O próximo passo natural é usar o `kof.db` com SQLite e uma restrição de nome único.
+O schema do banco é criado na inicialização, mas ainda não há migrações. Se a tabela precisar mudar, hoje isso é feito na mão.
 
 O bloqueio por conta tem um efeito colateral: qualquer um pode travar a conta de outra pessoa errando a senha dela cinco vezes. Dá para melhorar com atraso progressivo, CAPTCHA depois de algumas falhas ou bloqueando pelo par conta e IP.
 
 O cadastro diz quando um nome já está em uso. É a troca comum entre segurança e usabilidade, e o rate limit segura a varredura em massa.
 
-Atrás de um proxy, o limite por IP enxerga o IP do proxy, não o do cliente. Também não tem HTTPS: coloque um proxy reverso na frente ou use o `app.listenSecure` da Kof. E como a lista de revogados e os contadores de tentativa vivem na memória, rodar várias instâncias exigiria guardar isso num lugar compartilhado. Por fim, não há refresh token, então é preciso logar de novo a cada 15 minutos.
+Atrás de um proxy, o limite por IP enxerga o IP do proxy, não o do cliente. Também não tem HTTPS: coloque um proxy reverso na frente ou use o `app.listenSecure` da Kof. As contas já sobrevivem a um restart, mas a lista de tokens revogados e os contadores de tentativa ainda vivem na memória. Reiniciar o servidor zera os dois, e rodar várias instâncias exigiria guardar isso num lugar compartilhado. Por fim, não há refresh token, então é preciso logar de novo a cada 15 minutos.
 
 ## O que encontrei na Kof
 
@@ -78,5 +92,7 @@ A Kof ainda está em beta, e construir algo real com ela revelou coisas que mere
 O mais sério é que a opção `publicPaths` do `app.security` não funciona junto com `auth: true`. Ela só é consultada em outro modo de autenticação, então com JWT toda rota passa a exigir token, inclusive a de login. Por isso fiz o controle de acesso num middleware próprio.
 
 O segundo também é de segurança: essa mesma lista de rotas públicas compara por prefixo. Liberar `/public` acaba liberando `/publicAdmin` junto.
+
+O terceiro apareceu na etapa do banco de dados: erros do banco não são capturados pelo `catch (String e)`. A exceção do driver escapa direto, e dentro de uma rota vira um erro 500. Por isso o cadastro não tenta inserir e capturar a violação de unicidade; ele usa `ON CONFLICT` e confere quantas linhas entraram. E, falando em 500, a resposta padrão desse erro devolve ao cliente a mensagem interna da exceção. Testei com uma consulta a uma tabela inexistente, e a resposta trouxe o erro do SQLite com o nome da tabela. É o tipo de detalhe que ajuda quem está atacando a mapear o sistema.
 
 Os outros são menores. Um exemplo da documentação do `kof.web` não compila mais, porque coloca `true` num mapa que já tem textos e a Kof não aceita coleções com tipos misturados (passar `"true"` resolve). Um middleware que só devolve `null` compila, mas quebra toda requisição com erro 500. O `json.decode` deixa um campo ausente como `null` mesmo em um tipo que não aceita nulo, o que fura a null safety da linguagem; esta API confere isso na mão. E no target JVM, sem locale UTF-8 no sistema, os acentos saem como `?`, enquanto no nativo saem certos.
